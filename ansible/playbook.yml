@@ -179,3 +179,100 @@
     - name: Show nodes
       ansible.builtin.debug:
         var: nodes_wide.stdout_lines
+
+- name: Install Argo CD
+  hosts: control_plane
+  become: true
+  vars:
+    argocd_version: v3.6.2
+    helm_repo: git@github.com:Eng-Moaz/depi-helm.git
+    apps_repo: git@github.com:Eng-Moaz/depi-argocd.git
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  tasks:
+    - name: Create the argocd namespace
+      ansible.builtin.shell: kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
+      changed_when: false
+
+    - name: Install Argo CD
+      ansible.builtin.command: >-
+        kubectl apply -n argocd --server-side --force-conflicts
+        -f https://raw.githubusercontent.com/argoproj/argo-cd/{{ argocd_version }}/manifests/install.yaml
+      changed_when: false
+
+    - name: Expose the Argo CD UI on NodePort 30443
+      ansible.builtin.command: >-
+        kubectl patch svc argocd-server -n argocd
+        -p '{"spec":{"type":"NodePort","ports":[{"name":"https","port":443,"nodePort":30443}]}}'
+      changed_when: false
+
+    - name: Wait for Argo CD to be ready
+      ansible.builtin.command: kubectl rollout status {{ item }} -n argocd --timeout=300s
+      loop:
+        - deployment/argocd-server
+        - deployment/argocd-repo-server
+        - deployment/argocd-redis
+        - deployment/argocd-applicationset-controller
+        - statefulset/argocd-application-controller
+      changed_when: false
+
+    # Read-only deploy keys, passed in from GitHub secrets. Skipped when not provided.
+    - name: Give Argo CD read access to the private repos
+      ansible.builtin.command:
+        cmd: kubectl apply -f -
+        stdin: "{{ manifest | to_nice_yaml }}"
+      vars:
+        manifest:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ item.name }}"
+            namespace: argocd
+            labels:
+              argocd.argoproj.io/secret-type: repository
+          stringData:
+            type: git
+            url: "{{ item.url }}"
+            sshPrivateKey: "{{ lookup('env', item.env) }}"
+      loop:
+        - { name: repo-depi-helm, url: "{{ helm_repo }}", env: ARGOCD_HELM_KEY }
+        - { name: repo-depi-argocd, url: "{{ apps_repo }}", env: ARGOCD_APPS_KEY }
+      when: lookup('env', item.env) | length > 0
+      no_log: true
+      changed_when: false
+
+    # The root Application watches apps/ in depi-argocd; every file there becomes an Application.
+    - name: Create the root Application
+      ansible.builtin.command:
+        cmd: kubectl apply -f -
+        stdin: "{{ root_app | to_nice_yaml }}"
+      vars:
+        root_app:
+          apiVersion: argoproj.io/v1alpha1
+          kind: Application
+          metadata:
+            name: root
+            namespace: argocd
+          spec:
+            project: default
+            source:
+              repoURL: "{{ apps_repo }}"
+              targetRevision: main
+              path: apps
+            destination:
+              server: https://kubernetes.default.svc
+              namespace: argocd
+            syncPolicy:
+              automated:
+                prune: true
+                selfHeal: true
+      changed_when: false
+
+    - name: Argo CD pods and applications
+      ansible.builtin.shell: kubectl get pods -n argocd; echo; kubectl get applications -n argocd
+      register: argo
+      changed_when: false
+
+    - name: Show Argo CD status
+      ansible.builtin.debug:
+        var: argo.stdout_lines

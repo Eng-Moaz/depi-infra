@@ -48,6 +48,8 @@ jobs:
         working-directory: ansible
     env:
       TF_OUTPUTS: ${{ needs.terraform.outputs.tf_outputs }}
+      ARGOCD_HELM_KEY: ${{ secrets.ARGOCD_HELM_KEY }}
+      ARGOCD_APPS_KEY: ${{ secrets.ARGOCD_APPS_KEY }}
     steps:
       - uses: actions/checkout@v4
       - uses: aws-actions/configure-aws-credentials@v4
