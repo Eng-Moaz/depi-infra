@@ -9,6 +9,21 @@
       ansible.builtin.wait_for_connection:
         timeout: 300
 
+    - name: Set the hostname to the inventory name (becomes the node name)
+      ansible.builtin.hostname:
+        name: "{{ inventory_hostname }}"
+
+    - name: Keep cloud-init from resetting the hostname
+      ansible.builtin.copy:
+        dest: /etc/cloud/cloud.cfg.d/99-preserve-hostname.cfg
+        content: "preserve_hostname: true\n"
+        mode: "0644"
+
+    - name: Make the hostname resolve locally
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        line: "127.0.1.1 {{ inventory_hostname }}"
+
     - name: Turn swap off
       ansible.builtin.command: swapoff -a
       changed_when: false
@@ -145,6 +160,13 @@
         (nodes.stdout_lines | select('search', ' Ready ') | list | length) == groups['k8s'] | length
       retries: 40
       delay: 15
+      changed_when: false
+
+    - name: Label the workers
+      ansible.builtin.command: kubectl label node {{ item }} node-role.kubernetes.io/worker= --overwrite
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      loop: "{{ groups['workers'] }}"
       changed_when: false
 
     - name: kubectl get nodes
