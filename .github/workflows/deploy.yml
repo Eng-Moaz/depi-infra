@@ -1,0 +1,113 @@
+name: Deploy infrastructure
+
+on:
+  push:
+    branches: [main]
+    paths: ["terraform/**", "ansible/**", ".github/workflows/deploy.yml"]
+  workflow_dispatch:
+
+concurrency: kubeadm
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    outputs:
+      tf_outputs: ${{ steps.out.outputs.json }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - run: terraform init -input=false
+      - run: terraform validate
+      - run: terraform apply -input=false -auto-approve
+
+      - id: out
+        run: echo "json=$(terraform output -json | jq -c .)" >> "$GITHUB_OUTPUT"
+
+  ansible:
+    needs: terraform
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ansible
+    env:
+      TF_OUTPUTS: ${{ needs.terraform.outputs.tf_outputs }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install Ansible
+        run: pipx install ansible-core
+
+      - name: Install SSH key
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/depi-tasks.pem
+          chmod 600 ~/.ssh/depi-tasks.pem
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Write inventory from Terraform outputs
+        run: |
+          get() { jq -er ".$1.value" <<<"$TF_OUTPUTS"; }
+          key=~/.ssh/depi-tasks.pem
+          bastion=$(get bastion_public_ip)
+          ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+          cat > inventory.ini <<INI
+          [control_plane]
+          control-plane ansible_host=$(get control_plane_private_ip)
+
+          [workers]
+          worker-1 ansible_host=$(get worker_1_private_ip)
+          worker-2 ansible_host=$(get worker_2_private_ip)
+
+          [k8s:children]
+          control_plane
+          workers
+
+          [k8s:vars]
+          ansible_user=ec2-user
+          ansible_ssh_private_key_file=$key
+          ansible_ssh_common_args='$ssh_opts -o ProxyCommand="ssh -i $key $ssh_opts -W %h:%p ec2-user@$bastion"'
+          INI
+
+      # The bastion only allows your laptop, so open it to this runner for the job.
+      - name: Allow this runner to SSH to the bastion
+        id: sg
+        run: |
+          ip=$(curl -4 -fsS https://checkip.amazonaws.com)
+          vpc=$(jq -er .vpc_id.value <<<"$TF_OUTPUTS")
+          sg=$(aws ec2 describe-security-groups \
+            --filters Name=vpc-id,Values="$vpc" Name=tag:Name,Values=bastion-sg \
+            --query 'SecurityGroups[0].GroupId' --output text)
+          aws ec2 authorize-security-group-ingress --group-id "$sg" \
+            --ip-permissions "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=${ip}/32,Description=gha-${GITHUB_RUN_ID}}]"
+          echo "sg=$sg" >> "$GITHUB_OUTPUT"
+          echo "ip=$ip" >> "$GITHUB_OUTPUT"
+
+      - run: ansible-playbook playbook.yml
+
+      - name: Close the bastion SSH rule
+        if: always() && steps.sg.outputs.sg != ''
+        run: |
+          aws ec2 revoke-security-group-ingress --group-id "${{ steps.sg.outputs.sg }}" \
+            --protocol tcp --port 22 --cidr "${{ steps.sg.outputs.ip }}/32"
